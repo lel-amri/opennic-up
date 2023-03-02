@@ -4,25 +4,50 @@ version="1.2"
 
 resolvconf="/etc/resolv.conf"
 usefile=0
+ipv4=
+ipv6=
 
-# pings run in parallel, send $1 pings to each target
-multiping() {
-  fping -q -p 400 -r 0 -c "$1" "${@:2}" 2>&1
-}
-
-# dns lookup nameserver hostname
-dnslookup() {
-  drill A "$2" @"$1" | awk '$1 == "'"$2"'." && $3 == "IN" && $4 == "A" {print $5; exit}'
-}
-
-showhelp() {
+showhelp() (
     printf -- "usage:  %s [options]\n" "$script"
     printf -- "options:\n"
     printf -- "   -q         quiet, show less information\n"
     printf -- "   -v         display version\n"
     printf -- "   -h         help\n"
     printf -- "   -f <file>  custom resolv.conf file\n"
-}
+    printf -- "   -4         check for IPv4 DNS servers\n"
+    printf -- "   -6         check for IPv6 DNS servers\n"
+)
+
+# pings run in parallel, send $1 pings to each target
+multiping() (
+  count=$1
+  shift
+  fping -q -p 400 -r 0 -c "$count" "$@" 2>&1
+)
+
+# dns lookup nameserver hostname
+dnslookup() (
+  OPTIND=1
+  rr_type=A
+  while getopts 46 name
+  do
+    case $name in
+      4)  rr_type=A
+          ;;
+      6)  rr_type=AAAA
+          ;;
+      ?)  printf -- 'Error: dnslookup does not accept option "%s"' "$OPTARG" >&2
+          exit 2
+          ;;
+    esac
+  done
+  shift $(($OPTIND - 1))
+  dns_server_ip=$1
+  shift
+  domain_name=$1
+  shift
+  drill "$domain_name" @"$dns_server_ip" "$rr_type" IN | sed -n -e "/^;; ANSWER SECTION:$/,/^$/ p" </tmp/reply | tail -n +2 | head -n -1 | awk '$4 == "'"$rr_type"'" {print $5; exit}'
+)
 
 log () {
     if [ "$quiet" -eq 0 ]; then echo "$@" >&2; fi
@@ -46,7 +71,7 @@ apicurl() {
 
 # arguments handling
 quiet=0
-while getopts ":hvqf:" opt; do
+while getopts ":hvqf:46" opt; do
     case "$opt" in
     h)
         showhelp
@@ -60,6 +85,10 @@ while getopts ":hvqf:" opt; do
     f)  resolvconf=$OPTARG
         usefile=1
         ;;
+    4)  ipv4=yes
+        ;;
+    6)  ipv6=yes
+        ;;
     :)  echo "Missing option argument for -$OPTARG" >&2
         exit 1
         ;;
@@ -69,6 +98,14 @@ while getopts ":hvqf:" opt; do
        ;;
     esac
 done
+
+if [ -z "$ipv4" ] && [ -z "$ipv6" ] ; then
+  ipv4=yes
+  ipv6=no
+else
+  ipv4=${ipv4:-no}
+  ipv6=${ipv6:-no}
+fi
 
 # check needed tools are present
 neededlist="awk sort curl fping drill"
@@ -87,7 +124,7 @@ for p in "${configpathlist[@]}"; do
   fi
 done
 
-initdns=${initdns:-"185.121.177.177 169.239.202.202 172.98.193.42"}
+initdns=${initdns:-"192.3.165.37 89.163.140.67 91.217.137.37 94.247.43.254 134.195.4.2 139.177.199.175"}
 # retrieve first responding dns from initdns list
 log "Selecting DNS among $initdns..."
 respondingdns=$(multiping 2 $initdns | awk -F/ '$5 + 0.0 < 10' | awk '{print $1;exit}')
@@ -112,8 +149,15 @@ if [ -n "$user" ] && [ -n "$auth" ]; then
   curl --silent --connect-timeout 60 --insecure "https://$wlapiip/ip/update/?user=$user&auth=$auth"
 fi
 
+api_opt_ipv=4
+if [ "$ipv4" = "yes" ] && [ "$ipv6" = "yes" ] ; then
+  api_opt_ipv=all
+elif [ "$ipv6" = "yes" ] ; then
+  api_opt_ipv=6
+fi
+
 # query the API: list format, ipv4 only, 200 sites, no server admin sorting, including servers with blocklist and IP whitelisting
-apiurl="https://$apihost/geoip/?list&ipv=4&res=200&adm=0&bl&wl"
+apiurl="https://$apihost/geoip/?list&ipv=$api_opt_ipv&res=200&bl&wl"
 log "$apiurl"
 allhosts=$(apicurl "$apiurl")
 
@@ -122,6 +166,8 @@ if [ -z "$allhosts" ]; then
   exit 1
 fi
 
+# sort hosts by reliability
+#allhosts=$(echo "$allhosts" | awk -F# '{ printf("%05d:%03d:%s\n", ($3 + 0.0) * 100, NR, $0) }' | sort -r | cut -c 11-)
 # filter hosts with more than 90% reliability
 myminreliability=${minreliability:-90}
 reliable=$(echo "$allhosts" | awk -F# '$3 + 0.0 > '"$myminreliability" | awk -F# '{print $1}')
@@ -133,7 +179,7 @@ if [ "$reliablecount" -ge 2 ]; then
   pingresults=$(multiping 20 $reliable)
 
   # packet loss must be below 10%, then sort the servers by their average response time, eventually keep only the IP column
-  responsive=$(echo "$pingresults" | awk -F/ '$5 + 0.0 < 10' | sort -t/ -nk8 | awk '{print $1}')
+  responsive=$(echo "$pingresults" | awk -F/ '$5 + 0.0 < 10' | sed -E "s/^([0-9.:]+) +: .*(min\/avg\/max = [0-9.]+\/([0-9.]+)\/[0-9.]+).*/\1 \3/" | awk '{ printf("%s %d\n", $1, ($2 + 0.0) * 100)}' | sort -nk2 | awk '{print $1}')
   responsivecount=$(echo "$responsive" | wc -l)
   log "resulting in $responsivecount responsive hosts"
 
